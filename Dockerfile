@@ -1,7 +1,7 @@
-# Dockerfile
+# Dockerfile per Render
 FROM python:3.11-slim
 
-# ffmpeg migliora compatibilità alcuni flussi
+# opzionale ma utile: ffmpeg per casi particolari
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -10,8 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
-# Cloud Run passa $PORT
-ENV PORT=8080
-EXPOSE 8080
+# 🔴 IMPORTANTE: usa la porta che Render mette in $PORT
+# (niente EXPOSE/ENV fissi; Render gestisce il routing)
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
