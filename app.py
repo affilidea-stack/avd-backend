@@ -17,7 +17,6 @@ def ydl_extract(u: str, extra_opts: dict | None = None):
         opts.update(extra_opts)
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(u, download=False)
-    # Se è playlist prendo il primo item
     if isinstance(info, dict) and "entries" in info and info["entries"]:
         info = info["entries"][0]
     return info
@@ -32,11 +31,9 @@ def extract(url: str = Query(..., description="URL della pagina video")):
         info = None
         host = (urlparse(url).netloc or "").lower()
 
-        # 1) tentativo standard
         try:
             info = ydl_extract(url)
         except Exception as e1:
-            # 2) fallback specifico per vimeo
             if "vimeo.com" in host:
                 info = ydl_extract(url, {
                     "http_headers": {"Referer": "https://vimeo.com/"},
@@ -50,7 +47,6 @@ def extract(url: str = Query(..., description="URL della pagina video")):
 
         variants = []
         for f in formats:
-            # Solo URL diretti (niente HLS/DASH manifest)
             if not f.get("url"):
                 continue
             proto = (f.get("protocol") or "").lower()
@@ -59,13 +55,11 @@ def extract(url: str = Query(..., description="URL della pagina video")):
                 continue
             if ext not in ("mp4", "webm", "m4v", "mov"):
                 continue
-
             height = f.get("height") or 0
-            fps    = f.get("fps")
-            label  = f"{ext.upper()} {height}p" if height else ext.upper()
+            fps = f.get("fps")
+            label = f"{ext.upper()} {height}p" if height else ext.upper()
             if fps:
                 label += f" {fps}fps"
-
             variants.append({"url": f["url"], "label": label})
 
         if not variants and info.get("url"):
@@ -73,5 +67,4 @@ def extract(url: str = Query(..., description="URL della pagina video")):
 
         return JSONResponse({"title": title, "variants": variants})
     except Exception as e:
-        # Rendi l’errore visibile per debug
         raise HTTPException(status_code=400, detail=str(e))
