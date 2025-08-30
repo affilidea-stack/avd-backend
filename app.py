@@ -1,9 +1,26 @@
 import os
+from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from yt_dlp import YoutubeDL
 
 app = FastAPI()
+
+def ydl_extract(u: str, extra_opts: dict | None = None):
+    opts = {
+        "quiet": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "nocheckcertificate": True,
+    }
+    if extra_opts:
+        opts.update(extra_opts)
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(u, download=False)
+    # Se è playlist prendo il primo item
+    if isinstance(info, dict) and "entries" in info and info["entries"]:
+        info = info["entries"][0]
+    return info
 
 @app.get("/healthz")
 def healthz():
@@ -11,28 +28,29 @@ def healthz():
 
 @app.get("/extract")
 def extract(url: str = Query(..., description="URL della pagina video")):
-    # Config YDL: niente download, solo info; niente playlist
-    ydl_opts = {
-        "quiet": True,
-        "noplaylist": True,
-        "skip_download": True,
-        "nocheckcertificate": True,
-    }
-
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = None
+        host = (urlparse(url).netloc or "").lower()
 
-        # Se il link punta a una playlist, prendo il primo item
-        if "entries" in info and info["entries"]:
-            info = info["entries"][0]
+        # 1) tentativo standard
+        try:
+            info = ydl_extract(url)
+        except Exception as e1:
+            # 2) fallback specifico per vimeo
+            if "vimeo.com" in host:
+                info = ydl_extract(url, {
+                    "http_headers": {"Referer": "https://vimeo.com/"},
+                    "extractor_args": {"vimeo": {"player_client": ["ios","android","html5"]}},
+                })
+            else:
+                raise e1
 
         title = info.get("title") or "video"
         formats = info.get("formats") or []
 
         variants = []
         for f in formats:
-            # prendiamo solo URL diretti (no HLS/DASH manifest)
+            # Solo URL diretti (niente HLS/DASH manifest)
             if not f.get("url"):
                 continue
             proto = (f.get("protocol") or "").lower()
@@ -48,15 +66,12 @@ def extract(url: str = Query(..., description="URL della pagina video")):
             if fps:
                 label += f" {fps}fps"
 
-            variants.append({
-                "url":   f["url"],
-                "label": label
-            })
+            variants.append({"url": f["url"], "label": label})
 
-        # fallback: alcuni video (es. certi YT) hanno solo “best”
         if not variants and info.get("url"):
             variants.append({"url": info["url"], "label": "Best"})
 
         return JSONResponse({"title": title, "variants": variants})
     except Exception as e:
+        # Rendi l’errore visibile per debug
         raise HTTPException(status_code=400, detail=str(e))
