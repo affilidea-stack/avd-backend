@@ -1,76 +1,75 @@
-import re
-from urllib.parse import urlparse
-import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-from yt_dlp import YoutubeDL
+from typing import List, Dict, Any
+import yt_dlp
 
 app = FastAPI()
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
-
-def ydl_extract(u: str, extra: dict | None = None):
-    opts = {
+def make_ydl():
+    ydl_opts = {
         "quiet": True,
-        "noplaylist": True,
+        "no_warnings": True,
         "skip_download": True,
-        "nocheckcertificate": True,
+        "noprogress": True,
+        "extract_flat": False,
+
+        # Evita “video unavailable” / pagine di consenso
+        "geo_bypass": True,
+        "geo_bypass_country": "US",
+        "extractor_args": {
+            # usa il client 'android' che funziona bene senza cookie
+            "youtube": {"player_client": ["android"]}
+        },
+
+        # headers conservativi
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+
+        # niente download di stream separati (DASH) lato server
+        "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best",
     }
-    if extra:
-        opts.update(extra)
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(u, download=False)
-    if isinstance(info, dict) and "entries" in info and info["entries"]:
-        info = info["entries"][0]
-    return info
+    return yt_dlp.YoutubeDL(ydl_opts)
 
-def extract_vimeo_manual(page_url: str):
-    # id numerico dalla URL
-    m = re.search(r"vimeo\.com/(?:.*?/)?(\d+)", page_url)
-    if not m:
-        raise ValueError("Vimeo: ID non trovato")
-    vid = m.group(1)
-
-    cfg_url = f"https://player.vimeo.com/video/{vid}/config"
-    headers = {
-        "User-Agent": UA,
-        "Accept": "application/json",
-        "Referer": f"https://vimeo.com/{vid}",
-        "Origin": "https://vimeo.com",
-    }
-    r = requests.get(cfg_url, headers=headers, timeout=15)
-    if r.status_code != 200:
-        raise ValueError(f"Vimeo config HTTP {r.status_code}")
-
-    j = r.json()
-    title = (j.get("video") or {}).get("title") or "video"
-    prog = (
-        ((j.get("request") or {}).get("files") or {}).get("progressive")
-        or ((j.get("files") or {}).get("progressive"))
-        or []
-    )
+def pick_variants(info: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Estrae varianti progressive con URL diretto (mp4/webm)."""
     variants = []
-    for f in prog:
-        url = f.get("url")
-        if not url:
+    fmts = info.get("formats") or []
+    for f in fmts:
+        # URL diretto e non frammentato
+        if not f.get("url"):
             continue
-        q = f.get("quality") or ""
-        fps = f.get("fps")
-        lbl = f"MP4 {q}"
-        if fps:
-            lbl += f" {fps}fps"
-        variants.append({"url": url, "label": lbl})
+        if f.get("protocol") in ("m3u8_native", "m3u8", "http_dash_segments", "dash"):
+            continue
+        ext = (f.get("ext") or "").lower()
+        if ext not in ("mp4", "webm"):
+            continue
+        height = int(f.get("height") or 0)
+        abr = int(f.get("abr") or 0)
+        vcodec = (f.get("vcodec") or "").lower()
+        # etichetta carina
+        if height > 0:
+            label = f"{ext.upper()} {height}p"
+        elif abr > 0:
+            label = f"{ext.upper()} {abr}kbps"
+        else:
+            label = ext.upper()
+        variants.append({
+            "url": f["url"],
+            "label": label,
+            "height": height,
+            "vcodec": vcodec,
+        })
 
-    # ordina per qualità
-    def to_int(s): 
-        import re
-        m = re.search(r"(\d{3,4})p", s or "")
-        return int(m.group(1)) if m else 0
-    variants.sort(key=lambda v: to_int(v["label"]), reverse=True)
-
-    if not variants:
-        raise ValueError("Nessuna variante progressive")
-    return {"title": title, "variants": variants}
+    # ordina per risoluzione discendente, poi MP4 prima di WEBM
+    variants.sort(key=lambda x: (x.get("height", 0), 1 if x["url"].lower().endswith(".webm") else 0), reverse=True)
+    # dedup per URL
+    seen = set(); out = []
+    for v in variants:
+        if v["url"] in seen: continue
+        seen.add(v["url"]); out.append(v)
+    return out
 
 @app.get("/healthz")
 def healthz():
@@ -78,43 +77,23 @@ def healthz():
 
 @app.get("/extract")
 def extract(url: str = Query(..., description="URL della pagina video")):
-    host = (urlparse(url).netloc or "").lower()
     try:
-        # Vimeo: prima prova manuale, poi fallback a yt-dlp
-        if "vimeo.com" in host:
-            try:
-                return JSONResponse(extract_vimeo_manual(url))
-            except Exception:
-                info = ydl_extract(url, {
-                    "http_headers": {"Referer": "https://vimeo.com/"},
-                    "extractor_args": {"vimeo": {"player_client": ["ios","android","html5"]}},
-                })
-        else:
-            info = ydl_extract(url)
+        with make_ydl() as ydl:
+            info = ydl.extract_info(url, download=False)
+            # playlist? prendi il primo entry
+            if info.get("_type") == "playlist" and info.get("entries"):
+                info = info["entries"][0]
+            title = info.get("title") or "video"
+            variants = pick_variants(info)
 
-        title = info.get("title") or "video"
-        formats = info.get("formats") or []
-        variants = []
-        for f in formats:
-            u = f.get("url")
-            if not u:
-                continue
-            proto = (f.get("protocol") or "").lower()
-            ext = (f.get("ext") or "").lower()
-            if proto not in ("http", "https"):
-                continue
-            if ext not in ("mp4", "webm", "m4v", "mov"):
-                continue
-            h = f.get("height") or 0
-            fps = f.get("fps")
-            label = f"{ext.upper()} {h}p" if h else ext.upper()
-            if fps:
-                label += f" {fps}fps"
-            variants.append({"url": u, "label": label})
+        if not variants:
+            raise HTTPException(status_code=424, detail="Nessuna variante diretta trovata (spesso il video è solo HLS/DASH o geo/age bloccato).")
 
-        if not variants and info.get("url"):
-            variants.append({"url": info["url"], "label": "Best"})
-
+        # JSON compatibile con l’app
         return JSONResponse({"title": title, "variants": variants})
+
+    except yt_dlp.utils.DownloadError as e:
+        # messaggio più chiaro
+        raise HTTPException(status_code=502, detail=f"yt-dlp error: {str(e).splitlines()[-1]}")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
