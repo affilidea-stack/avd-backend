@@ -1,5 +1,7 @@
+import os
 from fastapi import FastAPI, HTTPException, Query
-import yt_dlp
+from fastapi.responses import JSONResponse
+from yt_dlp import YoutubeDL
 
 app = FastAPI()
 
@@ -8,44 +10,53 @@ def healthz():
     return {"ok": True}
 
 @app.get("/extract")
-def extract(url: str = Query(..., min_length=6)):
+def extract(url: str = Query(..., description="URL della pagina video")):
+    # Config YDL: niente download, solo info; niente playlist
     ydl_opts = {
         "quiet": True,
         "noplaylist": True,
         "skip_download": True,
-        "extract_flat": False,
-        "geo_bypass": True,
         "nocheckcertificate": True,
-        "http_headers": {"User-Agent": "Mozilla/5.0"},
     }
+
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+
+        # Se il link punta a una playlist, prendo il primo item
+        if "entries" in info and info["entries"]:
+            info = info["entries"][0]
+
+        title = info.get("title") or "video"
+        formats = info.get("formats") or []
+
+        variants = []
+        for f in formats:
+            # prendiamo solo URL diretti (no HLS/DASH manifest)
+            if not f.get("url"):
+                continue
+            proto = (f.get("protocol") or "").lower()
+            ext   = (f.get("ext") or "").lower()
+            if proto not in ("http", "https"):
+                continue
+            if ext not in ("mp4", "webm", "m4v", "mov"):
+                continue
+
+            height = f.get("height") or 0
+            fps    = f.get("fps")
+            label  = f"{ext.upper()} {height}p" if height else ext.upper()
+            if fps:
+                label += f" {fps}fps"
+
+            variants.append({
+                "url":   f["url"],
+                "label": label
+            })
+
+        # fallback: alcuni video (es. certi YT) hanno solo “best”
+        if not variants and info.get("url"):
+            variants.append({"url": info["url"], "label": "Best"})
+
+        return JSONResponse({"title": title, "variants": variants})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-    title = info.get("title") or "video"
-    formats = info.get("formats") or []
-
-    variants = []
-    seen = set()
-    for f in formats:
-        # scarta audio-only o video-only
-        if (f.get("vcodec") in (None, "none")) or (f.get("acodec") in (None, "none")):
-            continue
-        # scarta manifest (m3u8/dash) perché non è un file diretto
-        proto = (f.get("protocol") or "")
-        if "m3u8" in proto or "dash" in proto:
-            continue
-
-        u = f.get("url")
-        if not u or u in seen:
-            continue
-        seen.add(u)
-
-        ext = (f.get("ext") or "mp4").upper()
-        h = f.get("height") or 0
-        label = f"{ext} {h}p" if h else ext
-        variants.append({"url": u, "label": label})
-
-    return {"title": title, "variants": variants}
